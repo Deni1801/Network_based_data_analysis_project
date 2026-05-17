@@ -1,0 +1,733 @@
+---
+title: "GSE22862"
+output: pdf_document
+date: "2025-03-26"
+---
+
+Upload libraries:
+
+```{r}
+library("GEOquery")
+library(ggplot2)
+library(useful) 
+```
+
+Get data:
+
+```{r}
+gse <- getGEO("GSE22862", destdir = ".", getGPL = FALSE)
+gse <- gse[[1]]
+#gse<- getGEO(file = "GSE22862_series_matrix.txt.gz", getGPL = FALSE)
+```
+Metadata extraction:
+```{r}
+metadata <- pData(gse)
+metadata$label <- ifelse(metadata$source_name_ch1 == "primary lung cancer", "T",
+                         ifelse(metadata$source_name_ch1 == "Normal lung", "N", NA))
+saveRDS(metadata, file = "metadata.rds")
+```
+Inspect matrix of expression values and plot the bloxplot:
+
+```{r}
+ex <- exprs(gse)
+saveRDS(ex, file = "expression_matrix_GSE22862.rds")
+dim(ex)
+colnames(ex)
+par(mar=c(6,2,2,1))
+# Example: match labels to columns of ex
+labels <- metadata$label[match(colnames(ex), metadata$geo_accession)]
+boxplot(ex, las=3, names = labels)
+```
+
+PCA: 
+
+```{r}
+pca <- prcomp(t(ex))
+screeplot(pca)
+```
+
+Plot of PCA:
+
+```{r}
+# Extract sample names from PCA
+sample_names <- rownames(pca$x)
+
+# Extract group info from metadata using sample names
+group <- metadata[sample_names, "label"]
+
+# Assign colors based on group labels
+grpcol <- ifelse(group == "T", "red", "blue")
+
+# PCA plots
+plot(pca$x[,1], pca$x[,2], xlab="PCA1", ylab="PCA2", 
+     main="PCA: Components 1 & 2", col=grpcol, pch=16)
+legend("topright", legend=c("T", "N"), col=c("red", "blue"), pch=16)
+
+plot(pca$x[,1], pca$x[,3], xlab="PCA1", ylab="PCA3", 
+     main="PCA: Components 1 & 3", col=grpcol, pch=16)
+legend("topright", legend=c("T", "N"), col=c("red", "blue"), pch=16)
+```
+Unsupervised learining methods:
+
+K-means:
+```{r}
+set.seed(42)
+k <- 2
+kmeans_result <- kmeans(t(ex), k) #nstart=20) #try it
+table(kmeans_result$cluster)
+colnames(ex)
+#plot(kmeans_result, data=t(ex)) + #geom_text(aes(label=gse$source_name_ch1),hjust=0,vjust=0)
+plot.kmeans(kmeans_result, data = t(ex)) +
+geom_text(aes(label=metadata$label),hjust=0,vjust=0)
+```
+
+Other method: the hierarchical one
+
+```{r}
+# Compute distance matrix between samples
+dist_matrix <- dist(t(ex))
+# Perform hierarchical clustering using Ward's method (minimizes within-cluster variance)
+hc_result <- hclust(dist_matrix, method = "ward.D")
+# Define number of desired clusters
+k <- 2
+# Cut the dendrogram to form 'k' clusters
+groups <- cutree(hc_result, k=k)
+# Display how many samples fall into each cluster
+table(groups)
+# Plot the hierarchical clustering dendrogram
+# 'hang = -1' makes leaf labels align at the same level
+# Use source name metadata from the GEO dataset as labels
+plot(hc_result, hang = -1, labels=metadata$label)
+# Draw rectangles around the clusters in the dendrogram to visualize the 'k' groups
+rect.hclust(hc_result, k = k, border = 2)  # red boxes around 2 clusters
+#rect.hclust(hc_result, k = 4, which = NULL, x = NULL, h = NULL, border = 2, cluster = NULL) # red boxes to show groups
+```
+Random Forest: 
+
+```{r}
+library(randomForest)
+
+# Use the existing label column ("T" for tumor, "N" for normal)
+group <- as.factor(metadata$label)
+
+# Log2-transform the expression matrix (samples are columns)
+#small.eset <- log2(ex)  # ex: gene expression matrix, genes x samples
+small.eset <- ex
+
+# Ensure dimensions are as expected
+dim(small.eset)  # Should be genes x samples (e.g., 20011 x 30)
+
+# Train the Random Forest classifier (transpose so samples are rows)
+set.seed(1234)
+rf <- randomForest(x = t(small.eset), y = group, ntree = 1800)
+
+# Plot the OOB error rate over number of trees
+plot(rf, main = "Random Forest OOB Error Rate")
+
+# Predict labels for the first 5 samples (just a test)
+predict(rf, t(small.eset[, 1:5]))
+# Plot sorted importance values
+plot(sort(rf$importance, decreasing = TRUE), 
+     main = "Sorted Feature Importance", 
+     ylab = "Importance Score", xlab = "Rank")
+varImpPlot(rf)  # if you want both MeanDecreaseAccuracy and Gini
+
+# Get probe (gene) names
+probe.names <- rownames(rf$importance)
+
+# Top 200 by importance
+top200 <- probe.names[order(rf$importance, decreasing = TRUE)[1:200]]
+
+# Save to file
+write.csv(top200, file = "probes-top200.txt", 
+          quote = FALSE, row.names = FALSE, col.names = FALSE)
+#exctract error rate 
+# Get the final (i.e., last) OOB error rate
+final_oob_error <- tail(rf$err.rate[, "OOB"], 1)
+final_oob_accuracy <- 1 - final_oob_error
+
+# Print
+cat("Final OOB Error Rate:", round(final_oob_error * 100, 2), "%\n")
+cat("Final OOB Accuracy:", round(final_oob_accuracy * 100, 2), "%\n")
+```
+Heatmap:
+```{r}
+#heatmap of the 25 top genes
+library(RColorBrewer)     
+
+top25 <- top200[1:25]
+
+sig_genes_idx <- which(rownames(small.eset) %in% top25)
+sig.eset <- small.eset[sig_genes_idx, ]
+
+# Setup heatmap colors and annotation
+hmcol <- colorRampPalette(brewer.pal(11, "PuOr"))(256)
+col_side_colors <- rep(hmcol[50], length(group))
+col_side_colors[group == "T"] <- hmcol[200]
+
+# Set sample labels as column names for heatmap
+colnames(sig.eset) <- paste0(group, "_", 1:length(group))
+
+heatmap(sig.eset, scale = "row", col = hmcol,
+        ColSideColors = col_side_colors,
+        main = "Heatmap of Top 25 Important Genes")
+
+```
+```{r}
+library(pheatmap)
+library(RColorBrewer)
+
+# Subset top 25 important genes
+top25 <- top200[1:25]
+sig_genes_idx <- which(rownames(small.eset) %in% top25)
+sig.eset <- small.eset[sig_genes_idx, ]
+
+# Row-scale the data
+scaled_eset <- t(scale(t(sig.eset)))
+
+# Set column names to reflect group
+colnames(scaled_eset) <- paste0(group, "_", 1:length(group))
+
+# Create group annotation
+annotation_col <- data.frame(Group = group)
+rownames(annotation_col) <- colnames(scaled_eset)
+
+# Set custom colors for T and N groups
+ann_colors <- list(
+  Group = c(T = "#F5E336",  # red for Tumor (CAF)
+            N = "#9C6EC5")  # blue for Normal (NF)
+)
+
+# Define heatmap color palette
+heat_colors <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(256)
+
+# Plot heatmap with annotated colors
+pheatmap(scaled_eset,
+         color = heat_colors,
+         annotation_col = annotation_col,
+         annotation_colors = ann_colors,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE,
+         fontsize_row = 8,
+         fontsize_col = 9,
+         main = "Heatmap of Top 25 Important Genes")
+
+```
+LDA:
+```{r}
+library(genefilter)
+labels <- factor(metadata$label, levels = c("N", "T"))
+# Run row-wise t-tests to find DE genes
+tt <- rowttests(ex, labels)
+
+# Keep genes with p-value < 0.1
+keepers <- which(tt$p.value < 0.1)
+ex_filtered <- ex[keepers, ]
+
+# Transpose matrix: samples x genes
+tex <- t(ex_filtered)
+
+# Combine expression with labels
+dat <- cbind(as.data.frame(tex), label = labels)
+# Get indices for normal and tumor samples
+normal_idx <- which(dat$label == "N")
+tumor_idx <- which(dat$label == "T")
+
+# Randomly select 5 from each group for test set
+set.seed(42)
+train_normal <- sample(normal_idx, length(normal_idx) - 5)
+train_tumor <- sample(tumor_idx, length(tumor_idx) - 5)
+train <- c(train_normal, train_tumor)
+
+# Remaining samples go to test set
+test <- setdiff(1:nrow(dat), train)
+# Fit LDA model
+library("MASS")
+mod <- lda(label ~ ., data = dat, prior = c(0.5, 0.5), subset = train)
+
+# Predict on training set (for visualization)
+mod.values <- predict(mod, dat[train, ])
+#plot(mod.values$x[,1], ylab = "LDA Axis")
+#text(mod.values$x[,1], labels = dat$label[train],col = as.numeric(dat$label[train]) + 1)
+
+#plot:
+library(ggplot2)
+
+df_plot <- data.frame(
+  sample = 1:length(train),
+  lda1 = mod.values$x[,1],
+  label = dat$label[train]
+)
+
+ggplot(df_plot, aes(x = sample, y = lda1, color = label, label = label)) +
+  geom_point(size = 2) +
+  geom_text(vjust = -1, fontface = "bold") +
+  labs(title = "LDA Axis 1 (Training Set)",
+       x = "Sample Index", y = "LDA Axis 1") +
+  theme_minimal()
+
+# Predict on test set
+preds <- predict(mod, dat[test, ])
+
+# Show confusion matrix
+table(Predicted = preds$class, Actual = dat$label[test])
+# Convert labels to numeric: N = 1, T = 2
+actual_numeric <- as.numeric(dat$label[test])
+pred_numeric <- as.numeric(preds$class)
+
+# Plot ROC curve
+library("pROC")
+roc_obj <- plot.roc(actual_numeric, pred_numeric,
+                    col = "blue", print.auc = TRUE,
+                    main = "LDA ROC Curve - GSE22862")
+```
+
+LASSO
+
+```{r}
+library(glmnet)
+library(pROC)
+
+# Transpose log2-transformed expression data (genes x samples → samples x genes)
+dat <- t(ex)
+
+# Create binary response: T = 1, N = 0
+y <- ifelse(metadata$label == "T", 1, 0)
+
+# Class-balanced train/test split
+set.seed(123)
+t_idx <- which(y == 1)
+n_idx <- which(y == 0)
+
+n_train_t <- round(0.7 * length(t_idx))
+n_train_n <- round(0.7 * length(n_idx))
+
+train_t <- sample(t_idx, n_train_t)
+train_n <- sample(n_idx, n_train_n)
+train_idx <- c(train_t, train_n)
+test_idx <- setdiff(seq_along(y), train_idx)
+
+# Fit LASSO logistic regression on training data
+fit <- glmnet(dat[train_idx, ], y[train_idx], 
+              family = "binomial", standardize = FALSE)
+
+# Cross-validation to select lambda
+cfit <- cv.glmnet(dat[train_idx, ], y[train_idx], 
+                  family = "binomial", standardize = FALSE)
+
+# Plot cross-validation curve
+plot(cfit)
+
+# Extract non-zero coefficients at optimal lambda
+coef_best <- coef(cfit, s = "lambda.min")
+print(coef_best)
+
+# Predict probabilities on test data
+pred_prob <- predict(cfit, dat[test_idx, ], s = "lambda.min", type = "response")
+pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+table(Predicted = pred_class, Actual = y[test_idx])
+
+# Plot ROC curve
+roc_obj <- roc(y[test_idx], as.numeric(pred_prob))
+plot(roc_obj, col = "darkred", print.auc = TRUE, main = "LASSO ROC Curve - GSE22862")
+
+```
+
+RF vs LDA vs LASSO
+```{r}
+library(genefilter)   # For row-wise t-tests
+library(caret)        # For model training, cross-validation, and performance comparison
+library(ggplot2)      # For plotting model comparison results
+library(glmnet)       # For LASSO logistic regression (used internally by caret)
+# Use your existing label column
+group <- factor(metadata$label)  # factor with levels "N", "T"
+
+tt <- rowttests(ex, group)
+keepers <- which(tt$p.value < 0.1)  # raw p-value filter; or use adjusted p-values if you want #tt$p.adjust < 0.1
+ex2 <- ex[keepers, ]  # subset genes by filter
+
+# Prepare data for modeling: transpose to samples x genes
+dat <- as.data.frame(t(ex2))
+dat$Class <- group  # Add class labels
+
+# Set seed for reproducibility
+set.seed(1234)
+
+# Define train control for 5-fold CV
+control <- trainControl(method = "cv", number = 5)
+metric <- "Accuracy"
+
+# Train LDA model
+fit.lda <- train(Class ~ ., data = dat, method = "lda", metric = metric, trControl = control)
+
+# Train Random Forest model
+fit.rf <- train(Class ~ ., data = dat, method = "rf", metric = metric, trControl = control)
+
+# Train LASSO (glmnet) model
+# Use alpha = 1 for LASSO (not ridge)
+fit.lasso <- train(Class ~ ., data = dat, method = "glmnet",
+                   family = "binomial",
+                   tuneGrid = expand.grid(alpha = 1, 
+                                          lambda = seq(0.01, 1, by = 0.05)),
+                   trControl = control,
+                   metric = metric)  #10^seq(-4, 1, length.out = 100)
+
+# Plot LASSO tuning results
+plot(fit.lasso)
+
+# Compare model performances
+results <- resamples(list(LDA = fit.lda, RF = fit.rf, Lasso = fit.lasso))
+summary(results)
+ggplot(results) + labs(y = "Accuracy", title = "Model Comparison (5-fold CV)")
+
+mean_accuracies_cv <- sapply(results$values[, grep("Accuracy", colnames(results$values))], mean)
+print(mean_accuracies_cv)
+
+
+# Repeat with repeated 5x5-fold CV for more stable estimates
+control2 <- trainControl(method = "repeatedcv", number = 5, repeats = 5)
+
+fit.lda.2 <- train(Class ~ ., data = dat, method = "lda", metric = metric, trControl = control2)
+fit.rf.2 <- train(Class ~ ., data = dat, method = "rf", metric = metric, trControl = control2)
+fit.lasso.2 <- train(Class ~ ., data = dat, method = "glmnet",
+                     family = "binomial",
+                     tuneGrid = expand.grid(alpha = 1, 
+                                            lambda = seq(0.01, 1, by = 0.05)), # should try this 10^(seq(-4,1,by=0.3 ))
+                     trControl = control2,
+                     metric = metric)
+
+results2 <- resamples(list(LDA = fit.lda.2, RF = fit.rf.2, Lasso = fit.lasso.2))
+summary(results2)
+ggplot(results2) + labs(y = "Accuracy", title = "Model Comparison (Repeated 5x5 CV)")
+
+
+mean_accuracies_rcv <- sapply(results2$values[, grep("Accuracy", colnames(results2$values))], mean)
+print(mean_accuracies_rcv)
+```
+SCUDO pt.1:
+```{r}
+# Load required libraries
+library(caret)
+library(rScudo)
+library(igraph)
+
+# Ensure expression matrix is log2-transformed
+#small.eset <- log2(ex)  # ex = expression matrix: genes x samples
+
+# Use metadata$label, mapping T/N to Tumor/Normal for SCUDO
+group <- metadata$label  # Should contain "T" and "N"
+f <- factor(group, levels = c("N", "T"), labels = c("Control", "Tumor"))
+
+#Train/test split
+set.seed(123)
+inTrain <- createDataPartition(f, list = FALSE)
+trainData <- small.eset[, inTrain]
+testData <- small.eset[, -inTrain]
+
+# Step 3: Train SCUDO signatures
+trainRes <- scudoTrain(trainData, groups = f[inTrain],  
+                       nTop = 25, nBottom = 25, alpha = 0.05)
+print(trainRes)
+
+# Inspect gene signatures
+head(upSignatures(trainRes)[, 1:5])
+head(consensusUpSignatures(trainRes))
+
+# Step 4: Visualize training network
+trainNet <- scudoNetwork(trainRes, N = 0.2)
+scudoPlot(trainNet, vertex.label = NA)
+
+# Step 5: Apply SCUDO to test set
+testRes <- scudoTest(trainRes, testData, f[-inTrain], 
+                     nTop = 25, nBottom = 25)
+testNet <- scudoNetwork(testRes, N = 0.2)
+scudoPlot(testNet, vertex.label = NA)
+
+# Step 6: Clustering (optional)
+if (!is.connected(testNet)) {
+  components <- clusters(testNet)
+  biggest_cluster <- which.max(components$csize)
+  subgraph <- induced_subgraph(testNet, which(components$membership == biggest_cluster))
+  testClust <- cluster_spinglass(subgraph, spins = 2)
+  plot(testClust, subgraph, vertex.label = NA)
+} else {
+  testClust <- cluster_spinglass(testNet, spins = 2)
+  plot(testClust, testNet, vertex.label = NA)
+}
+
+# Step 7: Classification
+classRes <- scudoClassify(trainData, testData, N = 0.25,
+                          nTop = 12, nBottom = 12,
+                          trainGroups = f[inTrain], alpha = 0.5)
+
+# Step 8: Evaluate classification
+confMat <- caret::confusionMatrix(classRes$predicted, f[-inTrain])
+print(confMat)
+```
+
+SCUDO pt.2:
+```{r}
+# Load required libraries
+library(caret)
+library(rScudo)
+library(igraph)
+
+# Step 1: Prepare class labels
+group <- metadata$label  # assuming it's a factor with "T" and "N"
+f <- factor(group, levels = c("N", "T"), labels = c("Control", "Tumor"))
+
+# Step 2: Partition the data into training and test sets
+set.seed(123)
+inTrain <- createDataPartition(f, p = 0.7, list = FALSE)
+trainData <- ex[, inTrain]
+testData <- ex[, -inTrain]
+
+# Step 3: Run SCUDO training on training set
+trainRes <- scudoTrain(trainData, groups = f[inTrain],  
+                       nTop = 25, nBottom = 25, alpha = 0.05)
+
+# Step 4: Tune nTop & nBottom using caret (cross-validation)
+set.seed(123)
+model <- scudoModel(nTop = (2:6)*5, nBottom = (2:6)*5, N = 0.25)
+control <- trainControl(method = "cv", number = 5, 
+                        summaryFunction = multiClassSummary,
+                        classProbs = TRUE)
+
+cvRes <- train(x = t(trainData), y = f[inTrain], 
+               method = model, trControl = control)
+
+# Step 5: Use best nTop/nBottom for SCUDO testing
+bestTop <- cvRes$bestTune$nTop
+bestBottom <- cvRes$bestTune$nBottom
+
+testRes <- scudoTest(trainRes, testData, f[-inTrain], 
+                     nTop = bestTop, nBottom = bestBottom)
+
+# Step 6: Visualize test network
+testNet <- scudoNetwork(testRes, N = 0.2)
+scudoPlot(testNet, vertex.label = NA)
+
+# Step 7: Classification using best parameters
+classRes <- scudoClassify(trainData, testData, 
+                          N = 0.25,
+                          nTop = bestTop, nBottom = bestBottom,
+                          trainGroups = f[inTrain], alpha = 0.05)
+
+# Step 8: Performance Evaluation
+confMat <- confusionMatrix(classRes$predicted, f[-inTrain])
+print(confMat)
+
+```
+
+Traduction of affimetrix IDs in symbols:
+
+```{r}
+library(GEOquery)
+library(org.Hs.eg.db)
+# Load platform annotation from GEO
+gpl <- getGEO("GPL5175", AnnotGPL = TRUE)
+gpl_table <- Table(gpl)
+top_annot <- gpl_table[gpl_table$ID %in% top200, c("ID", "GB_LIST")]
+# Get all unique RefSeq IDs from GB_LIST
+refseq_ids <- unique(unlist(strsplit(top_annot$GB_LIST, ",")))
+
+# Map RefSeq to gene symbols
+refseq_to_symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = refseq_ids,
+  column = "SYMBOL",
+  keytype = "REFSEQ",
+  multiVals = "first"
+)
+# Assign the first available gene symbol for each GB_LIST
+top_annot$SYMBOL <- sapply(top_annot$GB_LIST, function(gb_list) {
+  ids <- unlist(strsplit(gb_list, ","))
+  matched <- refseq_to_symbol[ids]
+  matched <- matched[!is.na(matched)]
+  if (length(matched) > 0) matched[[1]] else NA
+})
+write.csv(top_annot, "top200_with_symbols.csv", row.names = FALSE)
+```
+```{r}
+library(GEOquery)
+library(limma)
+library(org.Hs.eg.db)
+library(genefilter)
+
+# Step 3: Subset tt to only top 200 probes
+tt$ID <- rownames(tt)
+tt_top200 <- tt[tt$ID %in% top200, c("ID", "dm", "p.value")]
+
+# Step 4: Load GPL annotation for top probes
+gpl <- getGEO("GPL5175", AnnotGPL = TRUE)
+gpl_table <- Table(gpl)
+top_annot <- gpl_table[gpl_table$ID %in% top200, c("ID", "GB_LIST")]
+
+# Step 5: Map RefSeq -> Gene symbols
+refseq_ids <- unique(unlist(strsplit(top_annot$GB_LIST, ",")))
+refseq_to_symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = refseq_ids,
+  column = "SYMBOL",
+  keytype = "REFSEQ",
+  multiVals = "first"
+)
+
+top_annot$SYMBOL <- sapply(top_annot$GB_LIST, function(gb_list) {
+  ids <- unlist(strsplit(gb_list, ","))
+  matched <- refseq_to_symbol[ids]
+  matched <- matched[!is.na(matched)]
+  if (length(matched) > 0) matched[[1]] else NA
+})
+
+# Step 6: Merge annotation with top 200 differential stats
+merged <- merge(top_annot, tt_top200, by = "ID")
+merged <- merged[!is.na(merged$SYMBOL), ]
+
+# Step 7: Prepare pathfindR input
+pathfinder_input <- merged[, c("SYMBOL", "dm", "p.value")]
+colnames(pathfinder_input) <- c("Gene.symbol", "logFC", "p")
+
+# Preview
+head(pathfinder_input)
+```
+Functional enrichment analysis:
+```{r}
+library(gprofiler2)
+# Remove NA values and duplicates
+gene_list <- pathfinder_input$Gene.symbol
+gostres <- gost(
+  query = gene_list,
+  organism = "hsapiens",
+  ordered_query = FALSE,
+  multi_query = FALSE,
+  significant = TRUE,
+  exclude_iea = FALSE,
+  measure_underrepresentation = FALSE,
+  evcodes = FALSE,
+  user_threshold = 0.05,
+  correction_method = "g_SCS",
+  domain_scope = "annotated",
+  custom_bg = NULL,
+  numeric_ns = "",
+  sources = NULL,
+  as_short_link = FALSE
+)
+heaVd(gostres$result)
+gostplot(gostres, capped = TRUE, interactive = TRUE)
+p <- gostplot(gostres, capped = TRUE, interactive = FALSE)
+
+# Optionally highlight specific terms (example terms below)
+#publish_gostplot(p, 
+# highlight_terms = c("GO:0048013", "REAC:R-HSA-3928663"), 
+# filename = "gprofiler_plot.pdf"
+#)
+bp_terms <- subset(gostres$result, source == "GO:BP")
+head(bp_terms[order(bp_terms$p_value), ])
+# Identify columns that are lists
+list_cols <- sapply(bp_terms, is.list)
+
+# Collapse list columns into comma-separated strings
+bp_terms[list_cols] <- lapply(bp_terms[list_cols], function(x) sapply(x, function(y) paste(y, collapse = ",")))
+
+# Now write to CSV
+write.csv(bp_terms, "GO_BP_enrichment_top200.csv", row.names = FALSE)
+```
+
+Network analysis:
+```{r}
+library(dplyr)
+library(pathfindR)
+
+# Run enrichment analysis with actual data
+results_R <- run_pathfindR(
+  input = pathfinder_input,
+  gene_sets = "Reactome",   # You can also try "GO-BP", "KEGG"
+  iterations = 1            # For exploratory analysis; use 10+ for final results
+)
+
+# View top enriched pathways
+head(results_R)
+
+# Visualize a term-gene network graph
+term_gene_graph(results_R, num_terms = 10)
+
+# Cluster enriched pathways
+#clustered_results <- cluster_enriched_terms(results_R)
+
+# View clustered results
+#head(clustered_results)
+```
+
+```{r}
+library(dplyr)
+library(pathfindR)
+
+# Run enrichment analysis with actual data
+results_BP <- run_pathfindR(
+  input = pathfinder_input,
+  gene_sets = "GO-BP",   # You can also try "GO-BP", "KEGG"
+  iterations = 1            # For exploratory analysis; use 10+ for final results
+)
+
+# View top enriched pathways
+head(results_BP)
+
+# Visualize a term-gene network graph
+term_gene_graph(results_BP, num_terms = 10)
+
+# Cluster enriched pathways
+#clustered_results_GOBP <- cluster_enriched_terms(results_GOBP)
+
+# View clustered results
+#head(clustered_results_GOBP)
+```
+
+```{r}
+library(dplyr)
+library(pathfindR)
+
+# Run enrichment analysis with actual data
+results_CC <- run_pathfindR(
+  input = pathfinder_input,
+  gene_sets = "GO-CC",   # You can also try "GO-BP", "KEGG"
+  iterations = 1            # For exploratory analysis; use 10+ for final results
+)
+
+# View top enriched pathways
+head(results_CC)
+
+# Visualize a term-gene network graph
+term_gene_graph(results_CC, num_terms = 10)
+
+# Cluster enriched pathways
+#clustered_results_CC <- cluster_enriched_terms(results_CC)
+
+# View clustered results
+#head(clustered_results_CC)
+```
+
+```{r}
+library(dplyr)
+library(pathfindR)
+
+# Run enrichment analysis with actual data
+results_GOMF <- run_pathfindR(
+  input = pathfinder_input,
+  gene_sets = "GO-MF",   # You can also try "GO-BP", "KEGG"
+  iterations = 1            # For exploratory analysis; use 10+ for final results
+)
+
+# View top enriched pathways
+head(results_GOMF)
+
+# Visualize a term-gene network graph
+term_gene_graph(results_GOMF, num_terms = 10)
+
+# Cluster enriched pathways
+clustered_results_GOMF <- cluster_enriched_terms(results_GOMF)
+
+# View clustered results
+head(clustered_results_GOMF)
+```
